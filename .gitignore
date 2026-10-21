@@ -216,5 +216,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Base de datos MIT-BIH, descargada por wfdb.dl_database
+mitdb/
 # Streamlit
 .streamlit/secrets.toml
