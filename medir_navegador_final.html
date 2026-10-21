@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Medición de inferencia en el navegador</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.20.0/dist/tf-backend-wasm.js"></script>
+<style>
+  :root { --tinta:#1a1a1a; --suave:#666; --borde:#ddd; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; max-width: 820px;
+         margin: 0 auto; padding: 32px 20px 64px; color: var(--tinta); background: #fff;
+         line-height: 1.6; }
+  h1 { font-size: 24px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 17px; font-weight: 600; margin: 30px 0 10px; }
+  p.sub { color: var(--suave); margin: 0 0 24px; }
+  .paso { border: 1px solid var(--borde); border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
+  .paso strong { display: block; margin-bottom: 6px; font-size: 15px; }
+  .paso small { color: var(--suave); display: block; margin-bottom: 10px; }
+  input[type=file] { font-size: 14px; }
+  .listo { color: #1d6b3f; font-size: 14px; margin-top: 8px; }
+  button { font-size: 15px; padding: 10px 22px; border: 1px solid var(--tinta);
+           background: var(--tinta); color: #fff; border-radius: 6px; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.sec { background:#fff; color:var(--tinta); margin-left:8px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 14px; }
+  th, td { border: 1px solid var(--borde); padding: 7px 10px; text-align: left; }
+  th { background: #f7f7f7; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  #estado { margin-top: 14px; color: var(--suave); font-size: 14px; min-height: 22px; }
+  pre { background:#f7f7f7; border:1px solid var(--borde); border-radius:6px;
+        padding:14px; font-size:12.5px; overflow-x:auto; white-space:pre-wrap; }
+  .alerta { background:#fff6f6; border:1px solid #f0c8c8; border-radius:6px;
+            padding:12px 14px; font-size:14px; color:#8a2b2b; }
+  .ok { color:#1d6b3f; }
+</style>
+</head>
+<body>
+
+<h1>Medición de inferencia en el navegador</h1>
+<p class="sub">Ábrelo con doble clic. Mide los tres motores de cálculo en una sola corrida, con reloj robusto.</p>
+
+<div class="paso">
+  <strong>1. Pesos del modelo</strong>
+  <small>Selecciona <code>pesos.json</code>.</small>
+  <input type="file" id="fPesos" accept=".json">
+  <div class="listo" id="okPesos"></div>
+</div>
+
+<div class="paso">
+  <strong>2. Latidos de prueba</strong>
+  <small>Selecciona <code>latidos.json</code>.</small>
+  <input type="file" id="fDatos" accept=".json">
+  <div class="listo" id="okDatos"></div>
+</div>
+
+<div class="paso">
+  <strong>3. Motores de cálculo</strong>
+  <small>WebGL usa la tarjeta gráfica; WASM usa el procesador con instrucciones vectoriales;
+  CPU es la referencia sin optimizar y puede tardar varios minutos.</small>
+  <label><input type="checkbox" id="bWebgl" checked> WebGL</label>
+  &nbsp;&nbsp;<label><input type="checkbox" id="bWasm" checked> WASM</label>
+  &nbsp;&nbsp;<label><input type="checkbox" id="bCpu"> CPU</label>
+</div>
+
+<p><button id="btn" disabled>Ejecutar medición</button>
+<button id="btnCopiar" class="sec" disabled>Copiar resultados</button></p>
+<div id="estado"></div>
+
+<div id="salida"></div>
+
+<script>
+const N_CALENT = 25;
+const N_INDIV  = 200;
+
+const $ = (id) => document.getElementById(id);
+const estado = (t) => { $('estado').textContent = t; };
+const fmt = (x, d = 3) => Number(x).toLocaleString('es-CO', { minimumFractionDigits: d, maximumFractionDigits: d });
+
+let archPesos = null, archDatos = null;
+const revisar = () => { $('btn').disabled = !(archPesos && archDatos); };
+
+$('fPesos').addEventListener('change', (e) => {
+  archPesos = e.target.files[0] || null;
+  $('okPesos').textContent = archPesos ? `✓ ${archPesos.name} (${fmt(archPesos.size/1024, 1)} KB)` : '';
+  revisar();
+});
+$('fDatos').addEventListener('change', (e) => {
+  archDatos = e.target.files[0] || null;
+  $('okDatos').textContent = archDatos ? `✓ ${archDatos.name}` : '';
+  revisar();
+});
+
+function leerTexto(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = () => rej(new Error('No se pudo leer ' + file.name));
+    r.readAsText(file);
+  });
+}
+
+function percentil(v, p) {
+  const s = [...v].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(p * s.length))];
+}
+
+// Misma arquitectura que en Keras, en el mismo orden de capas,
+// para que el orden de los pesos coincida exactamente.
+function construirRed() {
+  const ef = tf.input({ shape: [252, 1] });
+  let x = tf.layers.conv1d({ filters: 32, kernelSize: 7, activation: 'relu', padding: 'same' }).apply(ef);
+  x = tf.layers.maxPooling1d({ poolSize: 2 }).apply(x);
+  x = tf.layers.conv1d({ filters: 64, kernelSize: 5, activation: 'relu', padding: 'same' }).apply(x);
+  x = tf.layers.maxPooling1d({ poolSize: 2 }).apply(x);
+  x = tf.layers.conv1d({ filters: 64, kernelSize: 3, activation: 'relu', padding: 'same' }).apply(x);
+  x = tf.layers.globalAveragePooling1d({}).apply(x);
+  const er = tf.input({ shape: [5] });
+  let z = tf.layers.concatenate().apply([x, er]);
+  z = tf.layers.dense({ units: 64, activation: 'relu' }).apply(z);
+  const sal = tf.layers.dense({ units: 4, activation: 'softmax' }).apply(z);
+  return tf.model({ inputs: [ef, er], outputs: sal });
+}
+
+function resolucionTemporizador(v) {
+  const u = [...new Set(v)].sort((a, b) => a - b);
+  let min = Infinity;
+  for (let i = 1; i < u.length; i++) min = Math.min(min, u[i] - u[i-1]);
+  return u.length < 2 ? Infinity : min;
+}
+
+async function medirBackend(nombre, pj, latidos, real) {
+  const ok = await tf.setBackend(nombre);
+  if (!ok) return null;
+  await tf.ready();
+
+  const t0 = performance.now();
+  const modelo = construirRed();
+  modelo.setWeights(pj.pesos.map(p => tf.tensor(p.valores, p.forma)));
+  const msCarga = performance.now() - t0;
+
+  const tFormaTodo = tf.tensor3d(latidos.map(b => b.forma.map(v => [v])), [latidos.length, 252, 1]);
+  const tRrTodo    = tf.tensor2d(latidos.map(b => b.rr), [latidos.length, 5]);
+  const nIndiv = nombre === 'cpu' ? 50 : N_INDIV;
+
+  // Calentamiento del camino individual
+  for (let i = 0; i < N_CALENT; i++) {
+    const j = i % latidos.length;
+    const f = tFormaTodo.slice([j, 0, 0], [1, 252, 1]);
+    const r = tRrTodo.slice([j, 0], [1, 5]);
+    const p = modelo.predict([f, r]);
+    await p.data();
+    tf.dispose([f, r, p]);
+  }
+  // Calentamiento del camino por lotes: compila los nucleos de ese tamano
+  { const p = modelo.predict([tFormaTodo, tRrTodo]); await p.data(); p.dispose(); }
+
+  // Individual: se cronometra cada latido y tambien el bloque completo.
+  // El valor agregado es robusto frente a navegadores que redondean el reloj.
+  const tiempos = [];
+  const tBloque0 = performance.now();
+  for (let i = 0; i < Math.min(nIndiv, latidos.length); i++) {
+    const f = tFormaTodo.slice([i, 0, 0], [1, 252, 1]);
+    const r = tRrTodo.slice([i, 0], [1, 5]);
+    const ti = performance.now();
+    const p = modelo.predict([f, r]);
+    await p.data();
+    tiempos.push(performance.now() - ti);
+    tf.dispose([f, r, p]);
+  }
+  const secuencial = (performance.now() - tBloque0) / tiempos.length;
+
+  const tl = performance.now();
+  const pLote = modelo.predict([tFormaTodo, tRrTodo]);
+  const probs = await pLote.data();
+  const msLote = performance.now() - tl;
+
+  let aciertos = 0;
+  for (let i = 0; i < latidos.length; i++) {
+    let mejor = 0;
+    for (let c = 1; c < 4; c++) if (probs[i*4 + c] > probs[i*4 + mejor]) mejor = c;
+    if (mejor === real[i]) aciertos++;
+  }
+
+  tf.dispose([pLote, tFormaTodo, tRrTodo]);
+  modelo.dispose();
+
+  return {
+    backend: nombre, msCarga, secuencial,
+    media: tiempos.reduce((a, b) => a + b, 0) / tiempos.length,
+    mediana: percentil(tiempos, 0.5),
+    p95: percentil(tiempos, 0.95),
+    resolucion: resolucionTemporizador(tiempos),
+    porLote: msLote / latidos.length,
+    msLote, n: tiempos.length,
+    exactitud: aciertos / latidos.length,
+  };
+}
+
+async function medir() {
+  $('btn').disabled = true;
+  $('salida').innerHTML = '';
+
+  try {
+    estado('Leyendo los archivos…');
+    const pj = JSON.parse(await leerTexto(archPesos));
+    const datos = JSON.parse(await leerTexto(archDatos));
+    const latidos = datos.latidos;
+    const real = latidos.map(b => b.clase);
+    const refPy = datos.exactitud_referencia_python;
+
+    await tf.setBackend('cpu'); await tf.ready();
+    const prueba = construirRed();
+    const esperados = prueba.getWeights();
+    if (esperados.length !== pj.pesos.length)
+      throw new Error(`La red espera ${esperados.length} tensores y el archivo trae ${pj.pesos.length}.`);
+    for (let i = 0; i < esperados.length; i++) {
+      const a = esperados[i].shape.join('x'), b = pj.pesos[i].forma.join('x');
+      if (a !== b) throw new Error(`El tensor ${i} no coincide: la red espera ${a} y el archivo trae ${b}.`);
+    }
+    prueba.dispose();
+
+    const pedidos = [];
+    if ($('bWebgl').checked) pedidos.push('webgl');
+    if ($('bWasm').checked)  pedidos.push('wasm');
+    if ($('bCpu').checked)   pedidos.push('cpu');
+    if (!pedidos.length) throw new Error('Selecciona al menos un motor de cálculo.');
+
+    if (pedidos.includes('wasm') && tf.wasm && tf.wasm.setWasmPaths) {
+      tf.wasm.setWasmPaths('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.20.0/dist/');
+    }
+
+    const res = [];
+    for (const b of pedidos) {
+      estado(`Midiendo con ${b.toUpperCase()}…` + (b === 'cpu' ? ' (puede tardar varios minutos)' : ''));
+      await new Promise(r => setTimeout(r, 50));
+      try {
+        const r = await medirBackend(b, pj, latidos, real);
+        res.push(r || { backend: b, fallo: 'no disponible en este navegador' });
+      } catch (e) {
+        res.push({ backend: b, fallo: e.message });
+      }
+    }
+
+    const kbJson = archPesos.size / 1024;
+    const kbBin = (pj.parametros * 4) / 1024;
+    const validos = res.filter(r => !r.fallo);
+    const grueso = validos.some(r => r.resolucion >= 0.5);
+
+    let html = '<h2>Resultados por motor de cálculo</h2><table><thead><tr>' +
+      '<th>Motor</th><th>Carga (ms)</th><th>Secuencial (ms/latido)</th>' +
+      '<th>Por lotes (ms/latido)</th><th>Ventana 10 s (ms)</th><th>Exactitud</th></tr></thead><tbody>';
+    for (const r of res) {
+      if (r.fallo) { html += `<tr><th>${r.backend.toUpperCase()}</th><td colspan="5">No se pudo medir: ${r.fallo}</td></tr>`; continue; }
+      html += `<tr><th>${r.backend.toUpperCase()}</th>` +
+        `<td class="num">${fmt(r.msCarga, 1)}</td>` +
+        `<td class="num">${fmt(r.secuencial)}</td>` +
+        `<td class="num">${fmt(r.porLote)}</td>` +
+        `<td class="num">${fmt(r.secuencial * 12, 1)}</td>` +
+        `<td class="num">${fmt(r.exactitud * 100, 2)} %</td></tr>`;
+    }
+    html += '</tbody></table>';
+
+    html += grueso
+      ? '<p style="font-size:14px;color:#666">El reloj de este navegador redondea los intervalos, así que la mediana y el percentil 95 por latido no son fiables. La columna «Secuencial» mide el bloque completo y lo divide entre el número de latidos, por lo que no se ve afectada: úsala para el artículo.</p>'
+      : '<p style="font-size:14px;color:#666">La columna «Secuencial» mide el bloque completo dividido entre el número de latidos. Coincide con la media por latido cuando el reloj tiene resolución suficiente.</p>';
+
+    let det = '<h2>Detalle por latido</h2><table><thead><tr><th>Motor</th><th>Media</th><th>Mediana</th><th>p95</th><th>Resolución del reloj</th></tr></thead><tbody>';
+    for (const r of validos) {
+      det += `<tr><th>${r.backend.toUpperCase()}</th><td class="num">${fmt(r.media)}</td>` +
+        `<td class="num">${fmt(r.mediana)}</td><td class="num">${fmt(r.p95)}</td>` +
+        `<td class="num">${isFinite(r.resolucion) ? fmt(r.resolucion, 2) + ' ms' : 'n/d'}</td></tr>`;
+    }
+    html += det + '</tbody></table>';
+
+    const malos = validos.filter(r => Math.abs(r.exactitud - refPy) >= 0.005);
+    html += malos.length
+      ? `<div class="alerta">La exactitud no coincide con la de Python (${fmt(refPy*100,2)} %) en: ${malos.map(r=>r.backend).join(', ')}.</div>`
+      : `<p class="ok">✓ Todos los motores coinciden con la exactitud de Python (${fmt(refPy*100, 2)} %).</p>`;
+
+    const mejor = validos.filter(r => !malos.includes(r)).sort((a, b) => a.secuencial - b.secuencial)[0];
+    if (mejor) html += `<p>Motor más rápido en modo secuencial: <strong>${mejor.backend.toUpperCase()}</strong>, con ${fmt(mejor.secuencial)} ms por latido.</p>`;
+
+    html += '<h2>Tamaño del modelo</h2><table><tbody>' +
+      `<tr><th>Parámetros</th><td class="num">${(pj.parametros||0).toLocaleString('es-CO')}</td></tr>` +
+      `<tr><th>float32 binario (formato de despliegue)</th><td class="num">${fmt(kbBin, 1)} KB</td></tr>` +
+      `<tr><th>float16 (cuantizado)</th><td class="num">${fmt(kbBin/2, 1)} KB</td></tr>` +
+      `<tr><th>JSON de esta medición</th><td class="num">${fmt(kbJson, 1)} KB</td></tr>` +
+      '</tbody></table>';
+
+    html += '<h2>Para pegar en el artículo</h2><pre id="texto"></pre>';
+    $('salida').innerHTML = html;
+
+    let resumen =
+`Equipo: [procesador, RAM, sistema operativo, GPU]
+Navegador: ${navigator.userAgent}
+Nucleos logicos: ${navigator.hardwareConcurrency || 'n/d'}
+Parametros: ${pj.parametros} | float32 binario: ${fmt(kbBin,1)} KB | float16: ${fmt(kbBin/2,1)} KB
+Exactitud de referencia (Python): ${fmt(refPy*100, 2)} %
+Resolucion del reloj: ${grueso ? 'gruesa (usar valores secuenciales)' : 'suficiente'}
+`;
+    for (const r of res) {
+      resumen += r.fallo
+        ? `\n[${r.backend}] no disponible: ${r.fallo}`
+        : `\n[${r.backend}] carga ${fmt(r.msCarga,1)} ms | secuencial ${fmt(r.secuencial)} ms/latido (n=${r.n}) | por lotes ${fmt(r.porLote)} ms/latido (${latidos.length} en ${fmt(r.msLote,1)} ms) | ventana 10 s ${fmt(r.secuencial*12,1)} ms | por latido media ${fmt(r.media)}, mediana ${fmt(r.mediana)}, p95 ${fmt(r.p95)}, resolucion ${isFinite(r.resolucion)?fmt(r.resolucion,2):'n/d'} ms | exactitud ${fmt(r.exactitud*100,2)} %`;
+    }
+
+    $('texto').textContent = resumen;
+    $('btnCopiar').disabled = false;
+    $('btnCopiar').onclick = () => {
+      navigator.clipboard.writeText(resumen);
+      $('btnCopiar').textContent = 'Copiado';
+      setTimeout(() => { $('btnCopiar').textContent = 'Copiar resultados'; }, 1500);
+    };
+    estado('Medición terminada.');
+
+  } catch (e) {
+    $('salida').innerHTML = `<div class="alerta"><strong>No se pudo completar la medición.</strong><br>${e.message}</div>`;
+    estado('');
+  } finally {
+    $('btn').disabled = false;
+  }
+}
+
+$('btn').addEventListener('click', medir);
+</script>
+</body>
+</html>
