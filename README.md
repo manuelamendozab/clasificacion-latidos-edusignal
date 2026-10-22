@@ -109,8 +109,7 @@ modelo: 27 652 parámetros ocupan 108 KB en precisión simple.
 ## Cómo citar
 
 Si utiliza este código, cite el artículo. El repositorio está archivado en
-Zenodo con DOI [pendiente].
-
+Zenodo: [10.5281/zenodo.23547727](https://doi.org/10.5281/zenodo.23547727).
 ## Licencia
 
 MIT. La base MIT-BIH Arrhythmia se rige por los términos de PhysioNet y no se
